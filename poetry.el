@@ -58,6 +58,11 @@
   :prefix "poetry-"
   :group 'tools)
 
+(defcustom poetry-log-io nil
+  "If non-nil, log all poetry i/o to the *poetry-log* buffer."
+  :group 'poetry
+  :type 'boolean)
+
 (defcustom poetry-virtualenv-path
   (cond
    ((or (eq system-type 'ms-dos)
@@ -141,6 +146,7 @@
                          (error nil))
                        (poetry-venv-activated-p)))
        :description "Virtualenv"
+       ("E" "Info" poetry-env-info)
        ("v" "Deactivate" poetry-venv-deactivate)]
   [:if (lambda () (and (poetry-find-project-root)
                        (condition-case nil
@@ -438,6 +444,24 @@ credential to use."
   (interactive)
   (poetry-call 'self:update))
 
+;;;###autoload
+(defun poetry-env-info ()
+  "Display full details of virtualenv"
+  (interactive)
+  (poetry-env "info" nil nil t))
+
+(defun poetry-env (&optional command args unsetenv displaybuf)
+  "Manipulate or display info about virtualenv(s)."
+  (let ((command (or command "info")))
+    (push command args)
+    (let ((compbufname (poetry-call 'env args nil displaybuf t unsetenv)))
+      (unless displaybuf
+	(with-current-buffer compbufname
+	  (goto-char (point-min))
+	  (let ((data (buffer-substring-no-properties
+                       (point-min) (point-max))))
+	    (string-trim data)))))))
+
 
 ;; Virtualenv support
 ;;;;;;;;;;;;;;;;;;;;;
@@ -449,7 +473,7 @@ credential to use."
   (when poetry-tracking-mode
     (poetry-error "Poetry tracking mode is activated, you should deactivate it before manually setting virtualenvs"))
   (poetry-ensure-in-project)
-  (pyvenv-activate (poetry-get-virtualenv)))
+  (pyvenv-activate (poetry-get-virtualenv t)))
 
 ;;;###autoload
 (defun poetry-venv-deactivate ()
@@ -478,7 +502,7 @@ credential to use."
 
 (defun poetry-venv-activated-p ()
   "Return t if the current project venv is activated."
-  (let ((venv (poetry-get-virtualenv)))
+  (let ((venv (poetry-get-virtualenv t)))
     (and venv
          pyvenv-virtual-env
          (equal (file-name-as-directory (expand-file-name venv))
@@ -527,22 +551,26 @@ It ensures that your python scripts are always executed in the right environment
   (when (not (string= (buffer-name) " *Minibuf-1*"))
   (cond
    ;; If in a poetry project, activate the associated virtualenv
-   ((and buffer-file-name (poetry-find-project-root) (poetry-get-virtualenv))
-    (let ((poetry-venv (poetry-get-virtualenv)))
-      (when (and poetry-venv
-                 (not (equal (file-name-as-directory poetry-venv)
-                             pyvenv-virtual-env)))
-        ;; Save previous virtualenv
-        (when (and pyvenv-virtual-env
-                   (not (member (file-name-as-directory pyvenv-virtual-env)
-                                poetry-venv-list)))
-          (setq poetry-saved-venv pyvenv-virtual-env))
-        (add-to-list 'poetry-venv-list (expand-file-name
-                                        (file-name-as-directory poetry-venv)))
-        (pyvenv-activate poetry-venv))))
+   ((and buffer-file-name (poetry-find-project-root) (poetry-get-virtualenv t))
+    (when (not (equal
+		(file-name-as-directory poetry-project-venv)
+		pyvenv-virtual-env))
+      (poetry-message
+       (format "Activating new virtualenv\n\tnew: %s\n\tcurrent: %s"
+	       poetry-project-venv
+	       pyvenv-virtual-env))
+      ;; Save previous virtualenv
+      (when (and pyvenv-virtual-env
+                 (not (member (file-name-as-directory pyvenv-virtual-env)
+                              poetry-venv-list)))
+        (setq poetry-saved-venv pyvenv-virtual-env))
+      (add-to-list 'poetry-venv-list (expand-file-name
+                                      (file-name-as-directory poetry-project-venv)))
+      (pyvenv-activate poetry-project-venv)))
    ;; If not in a poetry project, deactivate the poetry virtualenv
    ((and pyvenv-virtual-env
          (member (file-name-as-directory pyvenv-virtual-env) poetry-venv-list))
+    (poetry-message "Deactivating virtualenv")
     (if (not poetry-saved-venv)
         (pyvenv-deactivate)
       (pyvenv-activate poetry-saved-venv)
@@ -560,14 +588,16 @@ Operations are executed sequentially until the list is empty.")
 (defvar poetry-process nil
   "Poetry current compilation process.")
 
-(defun poetry-call (command &optional args project output blocking)
+(defun poetry-call (command &optional args project output blocking unsetenv)
   "Call poetry COMMAND with the given ARGS.
 
 PROJECT is the poetry project you want the command to be run for
 \(default to the current project).
 If OUTPUT is non-nil, display the compilation buffer.
 If BLOCKING is non-nil, wait until the compilation is over and return the
-compilation buffer name."
+compilation buffer name.
+IF UNSETENV is non-nil, make request after unsetting VIRTUAL_ENV (to work around
+possible bug in poetry)."
   ;; Wait for the queue to finish when making a blocking call
   (let (call-nmb (old-call-nmb -1))
     (while (and blocking (poetry--busy-p))
@@ -583,12 +613,12 @@ compilation buffer name."
       (add-to-list 'poetry-call-queue
                    (list command args (or project
                                           (poetry-find-project-root))
-                         output blocking)
+                         output blocking unsetenv)
                    t)
     ;; Else, run the call
-    (poetry-do-call command args project output blocking)))
+    (poetry-do-call command args project output blocking unsetenv)))
 
-(defun poetry-do-call (command &optional args project output blocking)
+(defun poetry-do-call (command &optional args project output blocking unsetenv)
   "Call poetry COMMAND with the given ARGS.
 
 Not queue-safe version of `poetry-call'.
@@ -597,7 +627,9 @@ PROJECT is the poetry project you want the command to be run for
 \(default to the current project).
 If OUTPUT is non-nil, display the compilation buffer.
 If BLOCKING is non-nil, wait until the compilation is over and return the
-compilation buffer name."
+compilation buffer name.
+IF UNSETENV is non-nil, make request after unsetting VIRTUAL_ENV (to work around
+possible bug in poetry)."
   (let ((default-directory (or project
                                (poetry-find-project-root)
                                default-directory)))
@@ -607,19 +639,22 @@ compilation buffer name."
                      (poetry-error "Could not find 'poetry' executable")))
            (args (if (or (string= command "run")
                          (string= command "config")
-                         (string= command "init"))
+                         (string= command "init")
+			 (string= command "env"))
                      (cl-concatenate 'list (list (symbol-name command))
                                      args)
                    (cl-concatenate 'list (list
                                           (symbol-name command)
                                           "-n" "--ansi")
                                    args))))
-      (let ((compilation-buffer-name-function
+      (let* ((compilation-buffer-name-function
              (lambda (_mode) (poetry-buffer-name)))
             (compilation-ask-about-save nil)
-            (compilation-save-buffers-predicate (lambda () nil)))
+            (compilation-save-buffers-predicate (lambda () nil))
+	    (poetry-command (concat prog " " (string-join args " ")))
+	    (commandstr (if unsetenv (concat "unset VIRTUAL_ENV; " poetry-command) poetry-command)))
         (save-window-excursion
-            (compile (concat prog " " (string-join args " "))))
+            (compile commandstr))
         ;; compilation hooks
         (with-current-buffer (poetry-buffer-name)
           (add-hook 'after-change-functions
@@ -663,6 +698,8 @@ compilation buffer name."
 (defun poetry--clean-compilation-buffer (compil-buf _msg)
   "Clean the compilation buffer COMPIL-BUF from compilation messages."
   (when (string-match (poetry-buffer-name) (buffer-name compil-buf))
+    ;; first copy i/o to poetry-log buffer if enabled
+    (if poetry-log-io (append-to-buffer "*poetry-log*" (point-min) (point-max)))
     (let ((beg (save-excursion (goto-char (point-min))
                                (forward-line 4)
                                (point)))
@@ -785,9 +822,9 @@ If OPT is non-nil, set an optional dep."
 (defvar-local poetry-project-venv nil
   "Path of the virtualenv associated to the poetry project.")
 
-(defun poetry-get-project-name ()
+(defun poetry-get-project-name (&optional unsetenv)
   "Return the current project name."
-  (or poetry-project-name
+  (or (and (not unsetenv) poetry-project-name)
       (setq poetry-project-name
             (let ((file (poetry-find-pyproject-file)))
               (when file
@@ -804,25 +841,17 @@ If OPT is non-nil, set an optional dep."
       (setq poetry-project-root
             (locate-dominating-file default-directory "pyproject.toml"))))
 
-(defun poetry-get-virtualenv ()
+(defun poetry-get-virtualenv (&optional unsetenv)
   "Return the current poetry project virtualenv, or nil if it does not exist."
   (poetry-ensure-in-project)
   (if (and poetry-project-venv
-           (file-exists-p poetry-project-venv))
-      poetry-project-venv
+           (file-exists-p poetry-project-venv)
+	   (string-match-p (poetry-get-project-name t) poetry-project-venv))
+	poetry-project-venv
     (setq poetry-project-venv
-          (or
-           ;; virtualenvs in project
-           (if (poetry-get-configuration "virtualenvs.in-project")
-               (concat (file-name-as-directory (poetry-find-project-root))
-                       ".venv")
-             ;; virtualenvs elsewhere
-             (car (directory-files
-                   (poetry-get-configuration "virtualenvs.path")
-                   t
-                   (format "%s-py"
-                           (poetry-get-project-name)))))
-           nil))))
+	  (condition-case nil
+		(poetry-env "info" '("-p") unsetenv nil)
+            (error nil)))))
 
 (defun poetry-find-pyproject-file ()
   "Return the location of the 'pyproject.toml' file."
